@@ -10,6 +10,7 @@ interface SimulationState {
   select(id: number): Promise<void>;
   start(scenarioId: number): Promise<SimulationRun>;
   confirm(id: number, note: string): Promise<void>;
+  dispose(id: number, payload: simulationApi.DisposeRiskPayload): Promise<void>;
 }
 
 export const useSimulationStore = create<SimulationState>((set) => ({
@@ -27,5 +28,9 @@ export const useSimulationStore = create<SimulationState>((set) => ({
   async confirm(id, note) {
     const selected = await simulationApi.confirmRisks(id, note);
     set({ selected, runs: (await simulationApi.listSimulations()).items });
+  },
+  async dispose(id, payload) {
+    await simulationApi.disposeRisk(id, payload);
+    set({ selected: await simulationApi.getSimulation(id), runs: (await simulationApi.listSimulations()).items });
   },
 }));

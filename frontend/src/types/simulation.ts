@@ -2,6 +2,7 @@ import type { FanScenario } from './scenario';
 
 export type SimulationStatus = 'queued' | 'running' | 'converged' | 'not_converged' | 'invalid_input' | 'failed';
 export type RiskLevel = 'info' | 'warning' | 'critical';
+export type DispositionAction = 'accept' | 'recalculate' | 'link_simulation';
 
 export interface RiskEvidence {
   rule_code: string;
@@ -12,6 +13,22 @@ export interface RiskEvidence {
   threshold: number;
   unit: string;
   description: string;
+}
+
+export interface RiskDisposition {
+  id: number;
+  simulation_run_id: number;
+  rule_code: string;
+  entity_type: string;
+  entity_id: number;
+  action: DispositionAction;
+  rationale: string;
+  authorization_ref: string;
+  linked_run_id?: number;
+  disposed_by: number;
+  disposed_by_email: string;
+  disposed_at: string;
+  created_at: string;
 }
 
 export interface SimulationRun {
@@ -32,5 +49,6 @@ export interface SimulationRun {
   risk_confirmed_by?: number;
   risk_confirmed_at?: string;
   confirmation_note: string;
+  dispositions?: RiskDisposition[] | null;
   scenario?: FanScenario;
 }

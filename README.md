@@ -37,6 +37,7 @@ docker compose down -v --remove-orphans
 - 风机方案固定执行 `draft -> pending_review -> approved -> archived`，驳回返回 `draft` 并保留原因；版本条件更新防止并发越级。
 - 根据巷道阻力关系执行确定性迭代，保存输入快照、每轮最大残差、节点压力、边风量和历史运行，不使用随机数伪造结果。
 - 计算风速超限、反向流、工作面需风缺口和关键路径中断四类规则证据，并要求复核员或管理员人工确认。
+- 严重（critical）联锁风险必须逐条处置：接受剩余风险（须填人工授权依据）、退回重算，或关联方案版本与网络快照一致、同一规则不再触发的后续已完成推演；处置人须不同于推演发起人，每条风险只允许成功处置一次，全部处置完成后才能确认整次风险。
 - JWT、RBAC、请求限流、request ID、结构化日志和不可变操作审计贯穿后端与前端权限表现。
 
 ## 技术栈
@@ -128,7 +129,8 @@ npm --prefix frontend run build
 | `POST` | `/api/v1/scenarios/:id/transition` | 提交、批准、驳回、归档 |
 | `GET/POST` | `/api/v1/simulations` | 历史查询与批准方案推演，启动独立限流 |
 | `GET` | `/api/v1/simulations/:id` | 完整结果和残差历史 |
-| `POST` | `/api/v1/simulations/:id/confirm-risks` | 人工确认风险证据 |
+| `POST` | `/api/v1/simulations/:id/confirm-risks` | 人工确认风险证据（严重风险须先全部逐条处置） |
+| `POST` | `/api/v1/simulations/:id/dispositions` | 逐条处置严重风险，处置人须不同于推演发起人 |
 | `GET` | `/api/v1/audits` | 按操作者、对象、状态和时间筛选审计 |
 
 响应统一为 `{ data, request_id, meta? }` 或 `{ error: { code, message, details? }, request_id }`，时间使用 RFC 3339 UTC 字符串。

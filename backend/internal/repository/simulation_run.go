@@ -30,7 +30,7 @@ func (r *SimulationRunRepository) List(ctx context.Context, page, pageSize int, 
 		return nil, 0, fmt.Errorf("count simulation runs: %w", err)
 	}
 	var runs []model.SimulationRun
-	err := query.Preload("Scenario").Order("started_at DESC, id DESC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&runs).Error
+	err := query.Preload("Scenario").Preload("Dispositions").Order("started_at DESC, id DESC").Offset((page - 1) * pageSize).Limit(pageSize).Find(&runs).Error
 	if err != nil {
 		return nil, 0, fmt.Errorf("list simulation runs: %w", err)
 	}
@@ -39,7 +39,7 @@ func (r *SimulationRunRepository) List(ctx context.Context, page, pageSize int, 
 
 func (r *SimulationRunRepository) Find(ctx context.Context, id uint) (*model.SimulationRun, error) {
 	var run model.SimulationRun
-	if err := r.db.WithContext(ctx).Preload("Scenario").First(&run, id).Error; err != nil {
+	if err := r.db.WithContext(ctx).Preload("Scenario").Preload("Dispositions").First(&run, id).Error; err != nil {
 		return nil, fmt.Errorf("find simulation run: %w", err)
 	}
 	return &run, nil
@@ -52,6 +52,18 @@ func (r *SimulationRunRepository) Create(ctx context.Context, run *model.Simulat
 		}
 		after, _ := json.Marshal(run)
 		audit.EntityID = run.ID
+		audit.AfterState = string(after)
+		return writeAudit(tx, audit)
+	})
+}
+
+func (r *SimulationRunRepository) CreateDisposition(ctx context.Context, disposition *model.RiskDisposition, audit AuditRecord) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(disposition).Error; err != nil {
+			return fmt.Errorf("create risk disposition: %w", err)
+		}
+		after, _ := json.Marshal(disposition)
+		audit.EntityID = disposition.ID
 		audit.AfterState = string(after)
 		return writeAudit(tx, audit)
 	})

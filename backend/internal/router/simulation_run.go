@@ -14,4 +14,5 @@ func registerSimulationRoutes(group *gin.RouterGroup, h *handler.SimulationRunHa
 	runs.GET("/:id", h.Get)
 	runs.POST("", middleware.RBACMiddleware(string(constants.RoleEngineer), string(constants.RoleAdmin)), limiter.Middleware(), h.Start)
 	runs.POST("/:id/confirm-risks", middleware.RBACMiddleware(string(constants.RoleReviewer), string(constants.RoleAdmin)), h.ConfirmRisks)
+	runs.POST("/:id/dispositions", middleware.RBACMiddleware(string(constants.RoleReviewer), string(constants.RoleAdmin)), h.DisposeRisk)
 }

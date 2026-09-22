@@ -3,12 +3,16 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"reflect"
 	"sort"
+	"strings"
 	"time"
 
 	"gorm.io/datatypes"
+	"gorm.io/gorm"
 
 	"mine-ventilation-network-simulator/backend/internal/constants"
 	"mine-ventilation-network-simulator/backend/internal/dto"
@@ -109,11 +113,189 @@ func (s *SimulationService) ConfirmRisks(ctx context.Context, id uint, note stri
 	if run.RunStatus == string(constants.SimulationStatusRunning) || run.RunStatus == string(constants.SimulationStatusQueued) {
 		return nil, api.Conflict("SIMULATION_NOT_FINISHED", "推演完成后才能确认风险证据")
 	}
+	pending, err := undisposedCriticalItems(run)
+	if err != nil {
+		return nil, api.Internal(err)
+	}
+	if len(pending) > 0 {
+		return nil, api.Conflict("RISK_DISPOSITION_INCOMPLETE", fmt.Sprintf("还有 %d 条严重联锁风险未逐条处置，全部处置完成后才能确认整次风险", len(pending)))
+	}
 	updated, err := s.runs.ConfirmRisks(ctx, id, actor.ID, note, actor.Audit("simulation_run.risks_confirmed", "simulation_run"))
 	if err != nil {
 		return nil, mapRepositoryError(err, "推演风险确认")
 	}
 	return updated, nil
+}
+
+// DisposeRisk 逐条处置严重联锁风险。处置人必须不同于推演发起人；每条风险
+// 证据只允许成功处置一次，数据库唯一索引保证重复或并发处置不会覆盖原证据。
+func (s *SimulationService) DisposeRisk(ctx context.Context, id uint, input dto.DisposeRiskRequest, actor Actor) (*model.RiskDisposition, error) {
+	run, err := s.runs.Find(ctx, id)
+	if err != nil {
+		return nil, mapRepositoryError(err, "推演记录")
+	}
+	if run.RunStatus == string(constants.SimulationStatusRunning) || run.RunStatus == string(constants.SimulationStatusQueued) {
+		return nil, api.Conflict("SIMULATION_NOT_FINISHED", "推演完成后才能处置严重风险")
+	}
+	if actor.ID == run.StartedBy {
+		return nil, api.Forbidden("复核员须不同于推演发起人，不能处置自己发起的推演风险")
+	}
+	if !constants.ValidDispositionAction(input.Action) {
+		return nil, api.BadRequest("INVALID_DISPOSITION_ACTION", "处置方式必须是 accept、recalculate 或 link_simulation", nil)
+	}
+	risks, err := decodeRiskFlags(run.RiskFlagsJSON)
+	if err != nil {
+		return nil, api.Internal(err)
+	}
+	var target *dto.RiskEvidence
+	for i := range risks {
+		if risks[i].RuleCode == input.RuleCode && risks[i].EntityType == input.EntityType && risks[i].EntityID == input.EntityID {
+			target = &risks[i]
+			break
+		}
+	}
+	if target == nil {
+		return nil, api.BadRequest("RISK_ITEM_NOT_FOUND", "未找到匹配的风险证据条目，请刷新后重试", nil)
+	}
+	if target.Level != string(constants.RiskLevelCritical) {
+		return nil, api.BadRequest("DISPOSITION_ONLY_FOR_CRITICAL", "只有严重联锁风险需要逐条处置，普通风险维持原有确认流程", nil)
+	}
+	disposition := &model.RiskDisposition{
+		SimulationRunID: run.ID,
+		RuleCode:        target.RuleCode,
+		EntityType:      target.EntityType,
+		EntityID:        target.EntityID,
+		Action:          input.Action,
+		Rationale:       strings.TrimSpace(input.Rationale),
+		DisposedBy:      actor.ID,
+		DisposedByEmail: actor.Email,
+		DisposedAt:      time.Now().UTC(),
+	}
+	switch constants.DispositionAction(input.Action) {
+	case constants.DispositionActionAccept:
+		authorizationRef := strings.TrimSpace(input.AuthorizationRef)
+		if len(authorizationRef) < 4 {
+			return nil, api.BadRequest("AUTHORIZATION_REF_REQUIRED", "接受严重风险必须填写人工授权依据", nil)
+		}
+		disposition.AuthorizationRef = authorizationRef
+	case constants.DispositionActionLinkSimulation:
+		if input.LinkedRunID == 0 {
+			return nil, api.BadRequest("LINKED_RUN_REQUIRED", "关联处置必须选择后续已完成推演", nil)
+		}
+		if err := s.validateLinkedRun(ctx, run, target, input.LinkedRunID); err != nil {
+			return nil, err
+		}
+		linkedRunID := input.LinkedRunID
+		disposition.LinkedRunID = &linkedRunID
+	}
+	audit := actor.Audit("simulation_run.risk_disposed", "risk_disposition")
+	audit.Metadata = string(mustJSON(map[string]interface{}{
+		"simulation_run_id": run.ID, "rule_code": target.RuleCode,
+		"entity_type": target.EntityType, "entity_id": target.EntityID, "action": input.Action,
+	}))
+	if err := s.runs.CreateDisposition(ctx, disposition, audit); err != nil {
+		if errors.Is(err, gorm.ErrDuplicatedKey) {
+			return nil, api.Conflict("DISPOSITION_ALREADY_EXISTS", "该风险条目已完成处置，重复或并发处置不会覆盖原证据")
+		}
+		return nil, mapRepositoryError(err, "风险处置")
+	}
+	return disposition, nil
+}
+
+// validateLinkedRun 校验关联推演可以作为处置依据：必须是当前推演之后已完成
+// 的运行，其方案版本与网络快照与当前状态一致，且同一规则不再触发。
+func (s *SimulationService) validateLinkedRun(ctx context.Context, run *model.SimulationRun, target *dto.RiskEvidence, linkedRunID uint) error {
+	linked, err := s.runs.Find(ctx, linkedRunID)
+	if err != nil {
+		return mapRepositoryError(err, "关联推演")
+	}
+	if linked.RunStatus == string(constants.SimulationStatusRunning) || linked.RunStatus == string(constants.SimulationStatusQueued) {
+		return api.Conflict("LINKED_RUN_NOT_FINISHED", "关联推演必须是已完成的运行")
+	}
+	subsequent := linked.StartedAt.After(run.StartedAt) || (linked.StartedAt.Equal(run.StartedAt) && linked.ID > run.ID)
+	if !subsequent {
+		return api.Conflict("LINKED_RUN_NOT_SUBSEQUENT", "关联推演必须是当前推演之后的运行")
+	}
+	scenario, err := s.scenarios.Find(ctx, run.ScenarioID)
+	if err != nil {
+		return mapRepositoryError(err, "风机方案")
+	}
+	var linkedSnapshot simulationSnapshot
+	if err := json.Unmarshal(linked.InputSnapshotJSON, &linkedSnapshot); err != nil {
+		return api.Internal(fmt.Errorf("decode linked run snapshot: %w", err))
+	}
+	if linkedSnapshot.Scenario.ID != scenario.ID || linkedSnapshot.Scenario.Version != scenario.Version {
+		return api.Conflict("LINKED_RUN_SNAPSHOT_MISMATCH", "关联推演的方案版本必须与当前方案版本一致")
+	}
+	nodes, err := s.nodes.AllActive(ctx)
+	if err != nil {
+		return mapRepositoryError(err, "通风节点")
+	}
+	edges, err := s.edges.AllEnabled(ctx)
+	if err != nil {
+		return mapRepositoryError(err, "巷道边")
+	}
+	if !reflect.DeepEqual(normalizeViaJSON(nodes), normalizeViaJSON(linkedSnapshot.Nodes)) ||
+		!reflect.DeepEqual(normalizeViaJSON(edges), normalizeViaJSON(linkedSnapshot.Edges)) {
+		return api.Conflict("LINKED_RUN_SNAPSHOT_MISMATCH", "关联推演的网络快照必须与当前网络一致")
+	}
+	linkedRisks, err := decodeRiskFlags(linked.RiskFlagsJSON)
+	if err != nil {
+		return api.Internal(err)
+	}
+	for _, risk := range linkedRisks {
+		if risk.RuleCode == target.RuleCode && risk.EntityType == target.EntityType && risk.EntityID == target.EntityID {
+			return api.Conflict("LINKED_RULE_STILL_TRIGGERS", "关联推演中同一规则仍然触发，不能作为处置依据")
+		}
+	}
+	return nil
+}
+
+func decodeRiskFlags(raw datatypes.JSON) ([]dto.RiskEvidence, error) {
+	risks := []dto.RiskEvidence{}
+	if err := json.Unmarshal(raw, &risks); err != nil {
+		return nil, fmt.Errorf("decode risk flags: %w", err)
+	}
+	return risks, nil
+}
+
+func undisposedCriticalItems(run *model.SimulationRun) ([]dto.RiskEvidence, error) {
+	risks, err := decodeRiskFlags(run.RiskFlagsJSON)
+	if err != nil {
+		return nil, err
+	}
+	disposed := make(map[string]bool, len(run.Dispositions))
+	for _, item := range run.Dispositions {
+		disposed[dispositionKey(item.RuleCode, item.EntityType, item.EntityID)] = true
+	}
+	pending := make([]dto.RiskEvidence, 0)
+	for _, risk := range risks {
+		if risk.Level != string(constants.RiskLevelCritical) {
+			continue
+		}
+		if !disposed[dispositionKey(risk.RuleCode, risk.EntityType, risk.EntityID)] {
+			pending = append(pending, risk)
+		}
+	}
+	return pending, nil
+}
+
+func dispositionKey(ruleCode, entityType string, entityID uint) string {
+	return fmt.Sprintf("%s|%s|%d", ruleCode, entityType, entityID)
+}
+
+// normalizeViaJSON 通过 JSON 往返归一化时间等字段表示，使快照与实时查询
+// 结果可以按值比较。
+func normalizeViaJSON[T any](value T) T {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return value
+	}
+	var normalized T
+	if err := json.Unmarshal(data, &normalized); err != nil {
+		return value
+	}
+	return normalized
 }
 
 func solveNetwork(scenario model.FanScenario, nodes []model.VentilationNode, edges []model.AirwayEdge) solverResult {

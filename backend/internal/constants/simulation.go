@@ -29,6 +29,23 @@ func ValidSimulationStatus(value string) bool {
 	}
 }
 
+type DispositionAction string
+
+const (
+	DispositionActionAccept         DispositionAction = "accept"
+	DispositionActionRecalculate    DispositionAction = "recalculate"
+	DispositionActionLinkSimulation DispositionAction = "link_simulation"
+)
+
+func ValidDispositionAction(value string) bool {
+	switch DispositionAction(value) {
+	case DispositionActionAccept, DispositionActionRecalculate, DispositionActionLinkSimulation:
+		return true
+	default:
+		return false
+	}
+}
+
 const (
 	RiskRuleVelocity     = "AIR-VELOCITY-001"
 	RiskRuleReverseFlow  = "AIR-DIRECTION-002"
