@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"gorm.io/datatypes"
@@ -18,6 +19,8 @@ import (
 )
 
 const algorithmVersion = "air-balance-v1"
+
+var zeroTime = time.Unix(0, 0).UTC()
 
 type SimulationService struct {
 	runs      *repository.SimulationRunRepository
@@ -109,7 +112,13 @@ func (s *SimulationService) ConfirmRisks(ctx context.Context, id uint, note stri
 	if run.RunStatus == string(constants.SimulationStatusRunning) || run.RunStatus == string(constants.SimulationStatusQueued) {
 		return nil, api.Conflict("SIMULATION_NOT_FINISHED", "推演完成后才能确认风险证据")
 	}
-	updated, err := s.runs.ConfirmRisks(ctx, id, actor.ID, note, actor.Audit("simulation_run.risks_confirmed", "simulation_run"))
+	if actor.ID == run.StartedBy {
+		return nil, api.Forbidden("复核员必须不同于推演发起人，不能由本人确认本次风险")
+	}
+	if pending := PendingCriticalRiskKeys(run); len(pending) > 0 {
+		return nil, api.Conflict("CRITICAL_RISKS_PENDING", fmt.Sprintf("尚有 %d 条严重联锁风险未逐条处置，未全部处置不得确认整次风险", len(pending)))
+	}
+	updated, err := s.runs.ConfirmRisks(ctx, id, actor.ID, actor.Name, actor.Email, note, actor.Audit("simulation_run.risks_confirmed", "simulation_run"))
 	if err != nil {
 		return nil, mapRepositoryError(err, "推演风险确认")
 	}
@@ -314,4 +323,216 @@ func round(value float64, precision int) float64 {
 
 func simulationSummary(run model.SimulationRun) string {
 	return fmt.Sprintf("simulation %d (%s), iterations=%d residual=%.6f", run.ID, run.RunStatus, run.IterationCount, run.Residual)
+}
+
+// MakeRiskKey builds the stable identifier of one rule evidence item inside a
+// run. Risks are produced deterministically and stored read-only, so
+// (rule_code, entity_type, entity_id) uniquely identifies one item.
+func MakeRiskKey(ruleCode, entityType string, entityID uint) string {
+	return fmt.Sprintf("%s|%s|%d", strings.TrimSpace(ruleCode), strings.TrimSpace(entityType), entityID)
+}
+
+// findRiskEvidence returns the immutable risk evidence item identified by key.
+func findRiskEvidence(run *model.SimulationRun, riskKey string) (*dto.RiskEvidence, bool) {
+	var risks []dto.RiskEvidence
+	if err := json.Unmarshal(run.RiskFlagsJSON, &risks); err != nil {
+		return nil, false
+	}
+	for i := range risks {
+		if MakeRiskKey(risks[i].RuleCode, risks[i].EntityType, risks[i].EntityID) == riskKey {
+			return &risks[i], true
+		}
+	}
+	return nil, false
+}
+
+func runFinished(status string) bool {
+	return status != string(constants.SimulationStatusQueued) && status != string(constants.SimulationStatusRunning)
+}
+
+func riskDispositionIndex(run *model.SimulationRun) map[string]model.RiskDisposition {
+	index := make(map[string]model.RiskDisposition, len(run.RiskDispositions))
+	for _, item := range run.RiskDispositions {
+		index[item.RiskKey] = item
+	}
+	return index
+}
+
+// PendingCriticalRiskKeys lists critical evidence items without a disposition;
+// the whole-run confirmation stays blocked while this is non-empty.
+func PendingCriticalRiskKeys(run *model.SimulationRun) []string {
+	var risks []dto.RiskEvidence
+	if err := json.Unmarshal(run.RiskFlagsJSON, &risks); err != nil {
+		return nil
+	}
+	disposed := riskDispositionIndex(run)
+	pending := make([]string, 0)
+	for _, risk := range risks {
+		if risk.Level != string(constants.RiskLevelCritical) {
+			continue
+		}
+		key := MakeRiskKey(risk.RuleCode, risk.EntityType, risk.EntityID)
+		if _, ok := disposed[key]; !ok {
+			pending = append(pending, key)
+		}
+	}
+	return pending
+}
+
+// DisposeCriticalRisk records one reviewer decision for one critical risk item.
+// The reviewer must not be the engineer who started the run, every decision
+// needs a written rationale, accepting residual risk additionally requires a
+// manual authorization basis, and linking a follow-up run is only allowed when
+// that run is later, finished, used the same scenario version and an identical
+// network snapshot, and the same rule no longer triggers in it.
+func (s *SimulationService) DisposeCriticalRisk(ctx context.Context, runID uint, input dto.DisposeRiskRequest, actor Actor) (*model.SimulationRun, error) {
+	riskKey := strings.TrimSpace(input.RiskKey)
+	if !constants.ValidRiskDispositionDecision(input.Decision) {
+		return nil, api.BadRequest("INVALID_DISPOSITION_DECISION", "处置决定必须是 accept_residual、return_recalc 或 link_followup", nil)
+	}
+	rationale := strings.TrimSpace(input.Rationale)
+	if len([]rune(rationale)) < 4 {
+		return nil, api.BadRequest("INVALID_DISPOSITION_RATIONALE", "必须写明逐条处置依据（至少 4 个字符）", nil)
+	}
+	if input.Decision == string(constants.RiskDispositionAcceptResidual) && strings.TrimSpace(input.ManualAuthority) == "" {
+		return nil, api.BadRequest("MANUAL_AUTHORITY_REQUIRED", "接受严重剩余风险必须填写人工授权依据", nil)
+	}
+	if input.Decision == string(constants.RiskDispositionLinkFollowup) && (input.LinkedRunID == nil || *input.LinkedRunID == 0) {
+		return nil, api.BadRequest("LINKED_RUN_REQUIRED", "关联处置必须选择后续已完成推演", nil)
+	}
+
+	run, err := s.runs.Find(ctx, runID)
+	if err != nil {
+		return nil, mapRepositoryError(err, "推演记录")
+	}
+	if !runFinished(run.RunStatus) {
+		return nil, api.Conflict("SIMULATION_NOT_FINISHED", "推演完成后才能处置严重风险证据")
+	}
+	if run.RiskConfirmedAt != nil {
+		return nil, api.Conflict("RISKS_ALREADY_CONFIRMED", "整次风险已确认，处置证据不可再追加或修改")
+	}
+	if actor.ID == run.StartedBy {
+		return nil, api.Forbidden("复核员必须不同于推演发起人，不能由本人处置本次严重风险")
+	}
+	risk, ok := findRiskEvidence(run, riskKey)
+	if !ok {
+		return nil, api.NotFound("严重风险证据")
+	}
+	if risk.Level != string(constants.RiskLevelCritical) {
+		return nil, api.BadRequest("NOT_CRITICAL_RISK", "逐条处置仅适用于严重（critical）联锁风险，普通风险沿用整次确认", nil)
+	}
+	if _, exists := riskDispositionIndex(run)[riskKey]; exists {
+		return nil, api.Conflict("RISK_ALREADY_DISPOSED", "该条严重风险已处置，重复或并发提交不会覆盖原证据")
+	}
+
+	var linkedRunID *uint
+	if input.Decision == string(constants.RiskDispositionLinkFollowup) {
+		linked, err := s.validateFollowupLink(ctx, run, riskKey, *input.LinkedRunID)
+		if err != nil {
+			return nil, err
+		}
+		linkedRunID = &linked.ID
+	}
+
+	disposition := model.RiskDisposition{
+		SimulationRunID: run.ID, RiskKey: riskKey,
+		RuleCode: risk.RuleCode, Level: risk.Level, EntityType: risk.EntityType, EntityID: risk.EntityID,
+		Decision: input.Decision, Rationale: rationale,
+		ManualAuthority: strings.TrimSpace(input.ManualAuthority),
+		LinkedRunID:     linkedRunID,
+		DisposedBy:      actor.ID, DisposedByName: actor.Name, DisposedByEmail: actor.Email,
+	}
+	updated, err := s.runs.DisposeCriticalRisk(ctx, disposition, actor.Audit("simulation_run.risk_disposed", "simulation_run"))
+	if err != nil {
+		return nil, mapRepositoryError(err, "严重风险处置")
+	}
+	return updated, nil
+}
+
+func (s *SimulationService) validateFollowupLink(ctx context.Context, run *model.SimulationRun, riskKey string, linkedID uint) (*model.SimulationRun, error) {
+	if linkedID == run.ID {
+		return nil, api.BadRequest("LINKED_RUN_SAME_RUN", "不能将本次推演关联为自身的后续推演", nil)
+	}
+	linked, err := s.runs.Find(ctx, linkedID)
+	if err != nil {
+		return nil, mapRepositoryError(err, "后续推演记录")
+	}
+	if linked.ScenarioID != run.ScenarioID {
+		return nil, api.Conflict("LINKED_RUN_SCENARIO_MISMATCH", "后续推演必须基于同一个风机方案")
+	}
+	if !runFinished(linked.RunStatus) {
+		return nil, api.Conflict("LINKED_RUN_NOT_FINISHED", "被关联推演必须已完成计算")
+	}
+	// IDs are assigned monotonically; comparing both id and started_at keeps
+	// the "later run" requirement intact even when timestamps coincide.
+	if linked.ID <= run.ID || linked.StartedAt.Before(run.StartedAt) {
+		return nil, api.Conflict("LINKED_RUN_NOT_FOLLOWUP", "只能关联在本次推演之后发起的后续推演")
+	}
+	currentSnapshot, linkedSnapshot, err := loadSnapshotPair(run, linked)
+	if err != nil {
+		return nil, err
+	}
+	if currentSnapshot.Scenario.Version != linkedSnapshot.Scenario.Version {
+		return nil, api.Conflict("LINKED_RUN_VERSION_MISMATCH", fmt.Sprintf("后续推演的方案版本（v%d）与本次（v%d）不一致", linkedSnapshot.Scenario.Version, currentSnapshot.Scenario.Version))
+	}
+	if !sameNetworkSnapshot(currentSnapshot, linkedSnapshot) {
+		return nil, api.Conflict("LINKED_RUN_SNAPSHOT_MISMATCH", "后续推演的网络快照（节点与巷道）与本次不一致")
+	}
+	if _, stillTriggered := findRiskEvidence(linked, riskKey); stillTriggered {
+		return nil, api.Conflict("LINKED_RUN_RULE_STILL_TRIGGERED", "同一规则在后续推演中仍然触发，不能作为不再触发的证据")
+	}
+	return linked, nil
+}
+
+func loadSnapshotPair(current, linked *model.SimulationRun) (simulationSnapshot, simulationSnapshot, error) {
+	var currentSnapshot, linkedSnapshot simulationSnapshot
+	if err := json.Unmarshal(current.InputSnapshotJSON, &currentSnapshot); err != nil {
+		return currentSnapshot, linkedSnapshot, api.Internal(fmt.Errorf("parse current simulation snapshot: %w", err))
+	}
+	if err := json.Unmarshal(linked.InputSnapshotJSON, &linkedSnapshot); err != nil {
+		return currentSnapshot, linkedSnapshot, api.Internal(fmt.Errorf("parse linked simulation snapshot: %w", err))
+	}
+	return currentSnapshot, linkedSnapshot, nil
+}
+
+// sameNetworkSnapshot compares the network part of two input snapshots,
+// excluding bookkeeping timestamps so that identical network + scenario
+// versions compare equal across separate deterministic runs.
+func sameNetworkSnapshot(a, b simulationSnapshot) bool {
+	if len(a.Nodes) != len(b.Nodes) || len(a.Edges) != len(b.Edges) {
+		return false
+	}
+	canonicalNode := func(node model.VentilationNode) model.VentilationNode {
+		node.CreatedAt = zeroTime
+		node.UpdatedAt = zeroTime
+		return node
+	}
+	canonicalEdge := func(edge model.AirwayEdge) model.AirwayEdge {
+		edge.CreatedAt = zeroTime
+		edge.UpdatedAt = zeroTime
+		edge.FromNode = model.VentilationNode{}
+		edge.ToNode = model.VentilationNode{}
+		return edge
+	}
+	nodeByID := make(map[uint]model.VentilationNode, len(b.Nodes))
+	for _, node := range b.Nodes {
+		nodeByID[node.ID] = canonicalNode(node)
+	}
+	for _, node := range a.Nodes {
+		other, ok := nodeByID[node.ID]
+		if !ok || canonicalNode(node) != other {
+			return false
+		}
+	}
+	edgeByID := make(map[uint]model.AirwayEdge, len(b.Edges))
+	for _, edge := range b.Edges {
+		edgeByID[edge.ID] = canonicalEdge(edge)
+	}
+	for _, edge := range a.Edges {
+		other, ok := edgeByID[edge.ID]
+		if !ok || canonicalEdge(edge) != other {
+			return false
+		}
+	}
+	return true
 }

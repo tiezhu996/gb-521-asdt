@@ -8,6 +8,14 @@ type ConfirmRisksRequest struct {
 	Note string `json:"note" binding:"required,min=4,max=500"`
 }
 
+type DisposeRiskRequest struct {
+	RiskKey         string `json:"risk_key" binding:"required,max=120"`
+	Decision        string `json:"decision" binding:"required"`
+	Rationale       string `json:"rationale" binding:"required,min=4,max=500"`
+	ManualAuthority string `json:"manual_authority" binding:"omitempty,max=500"`
+	LinkedRunID     *uint  `json:"linked_run_id"`
+}
+
 type SimulationListQuery struct {
 	Page       int    `form:"page" binding:"omitempty,gte=1"`
 	PageSize   int    `form:"page_size" binding:"omitempty,gte=1,lte=100"`

@@ -1,25 +1,29 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Alert, Button, Select, Table, message } from 'antd';
+import { Alert, Button, Select, Table, Tag, message } from 'antd';
 import { Play, RefreshCw } from 'lucide-react';
 import type { ColumnsType } from 'antd/es/table';
 import { PageHeader } from '../components/common/PageHeader';
-import { RiskEvidenceTable } from '../components/common/RiskEvidenceTable';
+import { CriticalRiskSummary, RiskEvidenceTable } from '../components/common/RiskEvidenceTable';
+import { RiskDispositionDialog } from '../components/common/RiskDispositionDialog';
 import { StatusBadge } from '../components/common/StatusBadge';
 import { ResidualChart } from '../components/simulation/ResidualChart';
 import { useAuth } from '../hooks/useAuth';
 import { useSimulationPolling } from '../hooks/useSimulationPolling';
 import { useScenarioStore } from '../stores/scenarioStore';
 import { useSimulationStore } from '../stores/simulationStore';
-import type { SimulationRun } from '../types/simulation';
+import type { RiskEvidence, SimulationRun } from '../types/simulation';
+import { makeRiskKey } from '../types/simulation';
 import { reportError } from '../utils/errors';
 import { formatDateTime, formatNumber } from '../utils/format';
 
 export function SimulationsPage() {
-  const { hasRole } = useAuth();
+  const { user, hasRole } = useAuth();
   const { scenarios, load: loadScenarios } = useScenarioStore();
-  const { runs, selected, loading, load, select, start } = useSimulationStore();
+  const { runs, selected, loading, load, select, start, dispose } = useSimulationStore();
   const [scenarioId, setScenarioId] = useState<number>();
   const [starting, setStarting] = useState(false);
+  const [disposeRisk, setDisposeRisk] = useState<RiskEvidence | null>(null);
+  const [disposeBusy, setDisposeBusy] = useState(false);
   useSimulationPolling(true, 8000);
   useEffect(() => { loadScenarios().catch((error) => reportError(error, '方案列表加载失败')); }, [loadScenarios]);
   const approved = useMemo(() => scenarios.filter((item) => item.scenario_status === 'approved'), [scenarios]);
@@ -29,23 +33,65 @@ export function SimulationsPage() {
     setStarting(true);
     try { const run = await start(scenarioId); message.success(`推演 #${run.id} 已完成并保存结果快照`); } catch (error) { reportError(error, '推演未能启动'); } finally { setStarting(false); }
   };
+  const runsById = useMemo(() => new Map(runs.map((run) => [run.id, run])), [runs]);
+  const canDisposeSelected = Boolean(
+    selected && hasRole('reviewer', 'admin') && user && selected.started_by !== user.id && !selected.risk_confirmed_at
+      && !['queued', 'running'].includes(selected.run_status),
+  );
+  const pendingCriticalCount = selected
+    ? selected.risk_flags_json.filter((risk) => risk.level === 'critical' && !new Set((selected.risk_dispositions ?? []).map((item) => item.risk_key)).has(makeRiskKey(risk))).length
+    : 0;
+  const doDispose = async (input: Parameters<typeof dispose>[1]) => {
+    if (!selected) return;
+    setDisposeBusy(true);
+    try {
+      await dispose(selected.id, input);
+      message.success('该条严重风险处置已记录');
+      setDisposeRisk(null);
+    } catch (error) { reportError(error, '严重风险处置未完成'); } finally { setDisposeBusy(false); }
+  };
   const columns: ColumnsType<SimulationRun> = [
     { title: '运行', dataIndex: 'id', width: 90, render: (value) => <strong>#{value}</strong> },
-    { title: '方案', width: 220, render: (_, row) => row.scenario?.name ?? `方案 #${row.scenario_id}` },
+    { title: '方案', width: 200, render: (_, row) => row.scenario?.name ?? `方案 #${row.scenario_id}` },
     { title: '状态', dataIndex: 'run_status', width: 135, render: (value) => <StatusBadge status={value} /> },
-    { title: '迭代', dataIndex: 'iteration_count', width: 90 },
-    { title: '最终残差', dataIndex: 'residual', width: 130, render: (value) => <code>{formatNumber(value, 6)}</code> },
-    { title: '风险', width: 95, render: (_, row) => row.risk_flags_json?.length ?? 0 },
-    { title: '开始时间', dataIndex: 'started_at', width: 180, render: formatDateTime },
-    { title: '', width: 90, render: (_, row) => <Button size="small" onClick={() => select(row.id).catch((error) => reportError(error))}>查看</Button> },
+    { title: '迭代', dataIndex: 'iteration_count', width: 80 },
+    { title: '最终残差', dataIndex: 'residual', width: 125, render: (value) => <code>{formatNumber(value, 6)}</code> },
+    {
+      title: '风险处置', width: 150,
+      render: (_, row) => {
+        const critical = (row.risk_flags_json ?? []).filter((risk) => risk.level === 'critical').length;
+        if (critical === 0) return <span className="muted">{row.risk_flags_json?.length ?? 0} 条普通风险</span>;
+        const disposed = new Set((row.risk_dispositions ?? []).map((item) => item.risk_key));
+        const done = (row.risk_flags_json ?? []).filter((risk) => risk.level === 'critical' && disposed.has(makeRiskKey(risk))).length;
+        return <Tag color={done === critical ? 'success' : 'error'}>严重 {done}/{critical} 已处置</Tag>;
+      },
+    },
+    {
+      title: '整次确认', width: 160,
+      render: (_, row) => row.risk_confirmed_at
+        ? <span><StatusBadge status="confirmed" /><em className="confirm-by">{row.risk_confirmed_by_name || `#${row.risk_confirmed_by}`}</em></span>
+        : <span className="muted">待确认</span>,
+    },
+    { title: '开始时间', dataIndex: 'started_at', width: 170, render: formatDateTime },
+    { title: '', width: 90, render: (_, row) => <Button size="small" onClick={(event) => { event.stopPropagation(); select(row.id).catch(reportError); }}>查看</Button> },
   ];
   return (
     <div className="page">
       <PageHeader eyebrow="确定性求解器 / air-balance-v1" title="离线推演工作台" meta={<><span>{runs.length} 条历史运行</span><span>{approved.length} 个已批准方案</span><span>历史结果只读保留</span></>} actions={<Button icon={<RefreshCw size={17} />} onClick={() => load().catch(reportError)}>刷新结果</Button>} />
-      <Alert className="section-alert" type="warning" showIcon message="推演结果是离线决策证据，不是可直接执行的安全指令" />
+      <Alert className="section-alert" type="warning" showIcon message="推演结果是离线决策证据，不是可直接执行的安全指令；严重联锁风险须由非发起人的复核员逐条处置" />
       <section className="run-launcher" aria-labelledby="launch-heading"><div><span className="section-index">01</span><h2 id="launch-heading">选择已批准方案</h2></div><Select aria-label="已批准方案" value={scenarioId} onChange={setScenarioId} options={approved.map((item) => ({ value: item.id, label: `${item.name} · v${item.version}` }))} placeholder="当前没有可运行方案" /><Button type="primary" icon={<Play size={17} />} disabled={!scenarioId || !hasRole('engineer', 'admin')} loading={starting} onClick={() => void launch()}>开始离线推演</Button></section>
-      <section className="workspace-section"><div className="section-heading"><div><span className="section-index">02</span><h2>运行历史</h2></div></div><Table rowKey="id" columns={columns} dataSource={runs} loading={loading} size="small" pagination={{ pageSize: 8 }} scroll={{ x: 980 }} onRow={(row) => ({ onClick: () => select(row.id).catch(reportError) })} rowClassName={(row) => selected?.id === row.id ? 'selected-row' : ''} /></section>
-      {selected && <section className="workspace-section result-detail" aria-labelledby="result-heading"><div className="section-heading"><div><span className="section-index">03</span><h2 id="result-heading">运行 #{selected.id} 计算证据</h2></div><StatusBadge status={selected.run_status} /></div><div className="result-metrics"><div><span>迭代轮次</span><strong>{selected.iteration_count}</strong></div><div><span>最终残差</span><strong>{formatNumber(selected.residual, 6)}</strong></div><div><span>风险证据</span><strong>{selected.risk_flags_json?.length ?? 0}</strong></div><div><span>算法版本</span><strong>{selected.algorithm_version}</strong></div></div><ResidualChart values={selected.residuals_json ?? []} /><h3>联锁规则证据</h3><RiskEvidenceTable risks={selected.risk_flags_json ?? []} /></section>}
+      <section className="workspace-section"><div className="section-heading"><div><span className="section-index">02</span><h2>运行历史</h2></div></div><Table rowKey="id" columns={columns} dataSource={runs} loading={loading} size="small" pagination={{ pageSize: 8 }} scroll={{ x: 1120 }} onRow={(row) => ({ onClick: () => select(row.id).catch(reportError) })} rowClassName={(row) => selected?.id === row.id ? 'selected-row' : ''} /></section>
+      {selected && <section className="workspace-section result-detail" aria-labelledby="result-heading">
+        <div className="section-heading"><div><span className="section-index">03</span><h2 id="result-heading">运行 #{selected.id} 计算证据</h2></div><StatusBadge status={selected.run_status} /></div>
+        <div className="result-metrics"><div><span>迭代轮次</span><strong>{selected.iteration_count}</strong></div><div><span>最终残差</span><strong>{formatNumber(selected.residual, 6)}</strong></div><div><span>风险证据</span><strong>{selected.risk_flags_json?.length ?? 0}</strong></div><div><span>算法版本</span><strong>{selected.algorithm_version}</strong></div></div>
+        <ResidualChart values={selected.residuals_json ?? []} />
+        <CriticalRiskSummary run={selected} />
+        {selected.risk_confirmed_at && <p className="confirmation-line">整次确认：{selected.risk_confirmed_by_name || `用户 #${selected.risk_confirmed_by}`} · {formatDateTime(selected.risk_confirmed_at)} · {selected.confirmation_note}</p>}
+        {!selected.risk_confirmed_at && pendingCriticalCount > 0 && <p className="confirmation-line pending">尚有 {pendingCriticalCount} 条严重风险未逐条处置，请到联锁风险页完成处置后确认整次风险。</p>}
+        <h3>联锁规则证据{canDisposeSelected && '（严重风险可展开逐条处置）'}</h3>
+        <RiskEvidenceTable risks={selected.risk_flags_json ?? []} run={selected} runsById={runsById} canDispose={canDisposeSelected} onDispose={setDisposeRisk} />
+      </section>}
+      {selected && <RiskDispositionDialog open={Boolean(disposeRisk)} run={selected} risk={disposeRisk} followupRuns={runs} busy={disposeBusy} onCancel={() => setDisposeRisk(null)} onSubmit={doDispose} />}
     </div>
   );
 }

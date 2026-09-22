@@ -37,6 +37,7 @@ docker compose down -v --remove-orphans
 - 风机方案固定执行 `draft -> pending_review -> approved -> archived`，驳回返回 `draft` 并保留原因；版本条件更新防止并发越级。
 - 根据巷道阻力关系执行确定性迭代，保存输入快照、每轮最大残差、节点压力、边风量和历史运行，不使用随机数伪造结果。
 - 计算风速超限、反向流、工作面需风缺口和关键路径中断四类规则证据，并要求复核员或管理员人工确认。
+- 严重（critical）联锁风险必须由**不同于推演发起人**的复核员或管理员逐条处置：`接受剩余风险`（须填写人工授权依据）、`退回重算`、或`关联后续已完成推演`（必须同一方案版本、同一网络快照，且同一规则在后续推演中不再触发）；未全部处置不得确认整次风险；逐条处置通过唯一约束保证重复或并发提交只成功一次且不覆盖原证据。
 - JWT、RBAC、请求限流、request ID、结构化日志和不可变操作审计贯穿后端与前端权限表现。
 
 ## 技术栈
@@ -128,7 +129,8 @@ npm --prefix frontend run build
 | `POST` | `/api/v1/scenarios/:id/transition` | 提交、批准、驳回、归档 |
 | `GET/POST` | `/api/v1/simulations` | 历史查询与批准方案推演，启动独立限流 |
 | `GET` | `/api/v1/simulations/:id` | 完整结果和残差历史 |
-| `POST` | `/api/v1/simulations/:id/confirm-risks` | 人工确认风险证据 |
+| `POST` | `/api/v1/simulations/:id/confirm-risks` | 人工确认整次风险（严重风险须先全部逐条处置，且确认人不得是发起人） |
+| `POST` | `/api/v1/simulations/:id/dispose-critical-risk` | 逐条处置一条严重风险：接受剩余风险（须人工授权依据）/退回重算/关联后续推演 |
 | `GET` | `/api/v1/audits` | 按操作者、对象、状态和时间筛选审计 |
 
 响应统一为 `{ data, request_id, meta? }` 或 `{ error: { code, message, details? }, request_id }`，时间使用 RFC 3339 UTC 字符串。
@@ -144,9 +146,9 @@ npm --prefix frontend run build
 
 `SimulationStatus = queued | running | converged | not_converged | invalid_input | failed`：
 
-- 数据库约束与 model：`backend/internal/model/simulation_run.go`
-- 后端常量：`backend/internal/constants/simulation.go`
-- DTO、repository、service、handler、router：`backend/internal/dto/simulation_run.go`、`backend/internal/repository/simulation_run.go`、`backend/internal/service/simulation_run.go`、`backend/internal/handler/simulation_run.go`、`backend/internal/router/simulation_run.go`
+- 数据库约束与 model：`backend/internal/model/simulation_run.go`（含严重风险逐条处置实体 `RiskDisposition`）
+- 后端常量：`backend/internal/constants/simulation.go`（含 `RiskLevel` 与 `RiskDispositionDecision = accept_residual | return_recalc | link_followup`）
+- DTO、repository、service、handler、router：`backend/internal/dto/simulation_run.go`、`backend/internal/repository/simulation_run.go`、`backend/internal/service/simulation_run.go`（含逐条处置、闸门与后续推演快照校验）、`backend/internal/handler/simulation_run.go`、`backend/internal/router/simulation_run.go`
 - 前端类型、API、store、轮询 hook、共享状态组件、页面：`frontend/src/types/simulation.ts`、`frontend/src/api/simulations.ts`、`frontend/src/stores/simulationStore.ts`、`frontend/src/hooks/useSimulationPolling.ts`、`frontend/src/components/common/StatusBadge.tsx`、`frontend/src/pages/SimulationsPage.tsx`
 
 ## 算法假设与安全边界

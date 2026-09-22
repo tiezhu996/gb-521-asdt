@@ -19,6 +19,23 @@ const (
 	RiskLevelCritical RiskLevel = "critical"
 )
 
+type RiskDispositionDecision string
+
+const (
+	RiskDispositionAcceptResidual RiskDispositionDecision = "accept_residual"
+	RiskDispositionReturnRecalc   RiskDispositionDecision = "return_recalc"
+	RiskDispositionLinkFollowup   RiskDispositionDecision = "link_followup"
+)
+
+func ValidRiskDispositionDecision(value string) bool {
+	switch RiskDispositionDecision(value) {
+	case RiskDispositionAcceptResidual, RiskDispositionReturnRecalc, RiskDispositionLinkFollowup:
+		return true
+	default:
+		return false
+	}
+}
+
 func ValidSimulationStatus(value string) bool {
 	switch SimulationStatus(value) {
 	case SimulationStatusQueued, SimulationStatusRunning, SimulationStatusConverged,

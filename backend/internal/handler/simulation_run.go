@@ -82,3 +82,26 @@ func (h *SimulationRunHandler) ConfirmRisks(c *gin.Context) {
 	}
 	api.OK(c, item)
 }
+
+func (h *SimulationRunHandler) DisposeCriticalRisk(c *gin.Context) {
+	id, ok := ParseID(c)
+	if !ok {
+		return
+	}
+	actor, err := ActorFromContext(c)
+	if err != nil {
+		api.Fail(c, err)
+		return
+	}
+	var input dto.DisposeRiskRequest
+	if err := c.ShouldBindJSON(&input); err != nil {
+		api.BindError(c, err)
+		return
+	}
+	item, err := h.service.DisposeCriticalRisk(c.Request.Context(), id, input, actor)
+	if err != nil {
+		api.Fail(c, err)
+		return
+	}
+	api.OK(c, item)
+}
